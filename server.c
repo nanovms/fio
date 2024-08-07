@@ -84,7 +84,7 @@ struct fio_fork_item {
 #ifdef WIN32
 	struct ffi_element element;
 #else
-	pid_t pid;
+	pthread_t thread;
 #endif
 };
 
@@ -747,7 +747,7 @@ static void fio_server_check_fork_item(struct fio_fork_item *ffi)
 	}
 }
 #else
-static void fio_server_add_fork_item(pid_t pid, struct flist_head *list)
+static void fio_server_add_fork_item(pthread_t thread, struct flist_head *list)
 {
 	struct fio_fork_item *ffi;
 
@@ -755,17 +755,17 @@ static void fio_server_add_fork_item(pid_t pid, struct flist_head *list)
 	ffi->exitval = 0;
 	ffi->signal = 0;
 	ffi->exited = 0;
-	ffi->pid = pid;
+	ffi->thread = thread;
 	flist_add_tail(&ffi->list, list);
 }
 
-static void fio_server_add_conn_pid(struct flist_head *conn_list, pid_t pid)
+static void fio_server_add_conn_pid(struct flist_head *conn_list, pthread_t pid)
 {
 	dprint(FD_NET, "server: forked off connection job (pid=%u)\n", (int) pid);
 	fio_server_add_fork_item(pid, conn_list);
 }
 
-static void fio_server_add_job_pid(struct flist_head *job_list, pid_t pid)
+static void fio_server_add_job_pid(struct flist_head *job_list, pthread_t pid)
 {
 	dprint(FD_NET, "server: forked off job job (pid=%u)\n", (int) pid);
 	fio_server_add_fork_item(pid, job_list);
@@ -773,25 +773,15 @@ static void fio_server_add_job_pid(struct flist_head *job_list, pid_t pid)
 
 static void fio_server_check_fork_item(struct fio_fork_item *ffi)
 {
-	int ret, status;
+	int ret;
+	void *status;
 
-	ret = waitpid(ffi->pid, &status, WNOHANG);
-	if (ret < 0) {
-		if (errno == ECHILD) {
-			log_err("fio: connection pid %u disappeared\n", (int) ffi->pid);
-			ffi->exited = 1;
-		} else
-			log_err("fio: waitpid: %s\n", strerror(errno));
-	} else if (ret == ffi->pid) {
-		if (WIFSIGNALED(status)) {
-			ffi->signal = WTERMSIG(status);
-			ffi->exited = 1;
-		}
-		if (WIFEXITED(status)) {
-			if (WEXITSTATUS(status))
-				ffi->exitval = WEXITSTATUS(status);
-			ffi->exited = 1;
-		}
+	ret = pthread_tryjoin_np(ffi->thread, &status);
+	if (ret == 0) {
+		ffi->exitval = (intptr_t) status;
+		ffi->exited = 1;
+	} else if (ret != EBUSY) {
+		log_err("fio: waitpid: %s\n", strerror(ret));
 	}
 }
 #endif
@@ -807,7 +797,7 @@ static void fio_server_fork_item_done(struct fio_fork_item *ffi, bool stop)
 		ffi->element.hProcess = INVALID_HANDLE_VALUE;
 	}
 #else
-	dprint(FD_NET, "pid %u exited, sig=%u, exitval=%d\n", (int) ffi->pid, ffi->signal, ffi->exitval);
+	dprint(FD_NET, "thread %u exited, sig=%u, exitval=%d\n", (int) ffi->thread, ffi->signal, ffi->exitval);
 #endif
 
 	/*
@@ -869,7 +859,6 @@ static int handle_load_file_cmd(struct fio_net_cmd *cmd)
 	return 0;
 }
 
-#ifdef WIN32
 static void *fio_backend_thread(void *data)
 {
 	int ret;
@@ -883,7 +872,6 @@ static void *fio_backend_thread(void *data)
 	pthread_exit((void*) (intptr_t) ret);
 	return NULL;
 }
-#endif
 
 static int handle_run_cmd(struct sk_out *sk_out, struct flist_head *job_list,
 			  struct fio_net_cmd *cmd)
@@ -893,7 +881,6 @@ static int handle_run_cmd(struct sk_out *sk_out, struct flist_head *job_list,
 	fio_time_init();
 	set_genesis_time();
 
-#ifdef WIN32
 	{
 		pthread_t thread;
 		/* both this thread and backend_thread call sk_out_assign() to double increment
@@ -909,22 +896,6 @@ static int handle_run_cmd(struct sk_out *sk_out, struct flist_head *job_list,
 		fio_server_add_job_pid(job_list, thread);
 		return ret;
 	}
-#else
-    {
-		pid_t pid;
-		sk_out_assign(sk_out);
-		pid = fork();
-		if (pid) {
-			fio_server_add_job_pid(job_list, pid);
-			return 0;
-		}
-
-		ret = fio_backend(sk_out);
-		free_threads_shm();
-		sk_out_drop();
-		_exit(ret);
-	}
-#endif
 }
 
 static int handle_job_cmd(struct fio_net_cmd *cmd)
@@ -1405,7 +1376,7 @@ static int handle_connection(struct sk_out *sk_out)
 	close(sk_out->sk);
 	sk_out->sk = -1;
 	__sk_out_drop(sk_out);
-	_exit(ret);
+	return ret;
 }
 
 /* get the address on this host bound by the input socket,
@@ -1510,6 +1481,21 @@ static int handle_connection_process(void)
 	__sk_out_drop(sk_out);
 	return ret;
 }
+#else
+static void *handle_connection_thread(void *param)
+{
+	struct sk_out *sk_out = param;
+
+	/* if error, it's already logged, non-fatal */
+	get_my_addr_str(sk_out->sk);
+
+	/*
+	 * Assign sk_out here, it'll be dropped in handle_connection()
+	 * since that function calls _exit() when done
+	 */
+	sk_out_assign(sk_out);
+	return (void *)(intptr_t)handle_connection(sk_out);
+}
 #endif
 
 static int accept_loop(int listen_sk)
@@ -1532,7 +1518,7 @@ static int accept_loop(int listen_sk)
 #ifdef WIN32
 		HANDLE hProcess;
 #else
-		pid_t pid;
+		pthread_t thread;
 #endif
 		pfd.fd = listen_sk;
 		pfd.events = POLLIN;
@@ -1598,22 +1584,8 @@ static int accept_loop(int listen_sk)
 		sk_out->hProcess = hProcess;
 		fio_server_add_conn_pid(&conn_list, hProcess);
 #else
-		pid = fork();
-		if (pid) {
-			close(sk);
-			fio_server_add_conn_pid(&conn_list, pid);
-			continue;
-		}
-
-		/* if error, it's already logged, non-fatal */
-		get_my_addr_str(sk);
-
-		/*
-		 * Assign sk_out here, it'll be dropped in handle_connection()
-		 * since that function calls _exit() when done
-		 */
-		sk_out_assign(sk_out);
-		handle_connection(sk_out);
+		pthread_create(&thread, NULL, handle_connection_thread, sk_out);
+		fio_server_add_conn_pid(&conn_list, thread);
 #endif
 	}
 

@@ -367,28 +367,9 @@ static int add_thread_segment(void)
 
 	size += 2 * sizeof(unsigned int);
 
-#ifndef CONFIG_NO_SHM
-	seg->shm_id = shmget(0, size, IPC_CREAT | 0600);
-	if (seg->shm_id == -1) {
-		if (errno != EINVAL && errno != ENOMEM && errno != ENOSPC)
-			perror("shmget");
-		return -1;
-	}
-#else
 	seg->threads = malloc(size);
 	if (!seg->threads)
 		return -1;
-#endif
-
-#ifndef CONFIG_NO_SHM
-	seg->threads = shmat(seg->shm_id, NULL, 0);
-	if (seg->threads == (void *) -1) {
-		perror("shmat");
-		return 1;
-	}
-	if (shm_attach_to_open_removed())
-		shmctl(seg->shm_id, IPC_RMID, NULL);
-#endif
 
 	nr_segments++;
 
